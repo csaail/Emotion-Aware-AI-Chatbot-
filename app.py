@@ -1,5 +1,5 @@
 from flask import Flask, request, render_template_string, jsonify
-import requests, json, os
+import requests, json, os, re
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 import torch.nn.functional as F
@@ -17,13 +17,71 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 emotion_classifier = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
 emotion_classifier.eval()
 
-EMOTION_LABELS = [
+# GoEmotions 28-label canonical order (index 0–27)
+DEFAULT_EMOTION_LABELS = [
     "admiration", "amusement", "anger", "annoyance", "approval", "caring",
     "confusion", "curiosity", "desire", "disappointment", "disapproval",
     "disgust", "embarrassment", "excitement", "fear", "gratitude", "grief",
     "joy", "love", "nervousness", "optimism", "pride", "realization",
     "relief", "remorse", "sadness", "surprise", "neutral"
 ]
+
+def get_model_labels(model):
+    """
+    Safely extract label order from model config.
+    FIX: Normalises ALL keys to int before building the ordered list,
+    eliminating the str/int mismatch that caused 'sadness → surprise'.
+    """
+    id2label = getattr(model.config, "id2label", None)
+
+    if not isinstance(id2label, dict) or len(id2label) == 0:
+        print("[Labels] No id2label found — using DEFAULT_EMOTION_LABELS")
+        return DEFAULT_EMOTION_LABELS
+
+    # Normalise keys to int and values to lowercase str
+    try:
+        normalised = {int(k): str(v).lower() for k, v in id2label.items()}
+    except (ValueError, TypeError) as e:
+        print(f"[Labels] Key normalisation failed ({e}) — using DEFAULT_EMOTION_LABELS")
+        return DEFAULT_EMOTION_LABELS
+
+    # If all labels are generic placeholders (LABEL_0, LABEL_1 …) they're useless
+    if all(v.startswith("label_") for v in normalised.values()):
+        print("[Labels] Generic LABEL_N placeholders detected — using DEFAULT_EMOTION_LABELS")
+        return DEFAULT_EMOTION_LABELS
+
+    # Build a dense ordered list using sorted integer indices
+    max_idx = max(normalised.keys())
+    labels  = [normalised.get(i, "neutral") for i in range(max_idx + 1)]
+
+    print(f"[Labels] Loaded {len(labels)} labels from model config.")
+    print(f"[Labels] First 5: {labels[:5]}  …  Last 5: {labels[-5:]}")
+    return labels
+
+EMOTION_LABELS = get_model_labels(emotion_classifier)
+
+# ── Quick sanity check at startup ────────────────────────────
+def _startup_sanity_check():
+    test_phrases = [
+        ("I am feeling really sad today", "sadness"),
+        ("This is so surprising!", "surprise"),
+        ("I am so happy and joyful", "joy"),
+        ("I am furious and angry", "anger"),
+    ]
+    print("\n[Sanity] Emotion label check:")
+    for phrase, expected in test_phrases:
+        inputs = tokenizer(phrase, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            logits = emotion_classifier(**inputs).logits
+        probs  = F.softmax(logits, dim=-1)[0]
+        idx    = int(torch.argmax(probs).item())
+        label  = EMOTION_LABELS[idx] if idx < len(EMOTION_LABELS) else "?"
+        conf   = float(probs[idx].item()) * 100
+        status = "✅" if label == expected else f"⚠️  (expected {expected})"
+        print(f"  {status}  '{phrase[:40]}' → {label} ({conf:.1f}%)")
+    print()
+
+_startup_sanity_check()
 
 EMOTION_META = {
     "admiration":    {"color": "#7eb8f7", "emoji": "🌟"},
@@ -61,7 +119,6 @@ GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 # ── Models ───────────────────────────────────────────────────
-# Groq — genuinely free, fast, reliable (PRIMARY)
 GROQ_MODELS = [
     {"id": "llama-3.3-70b-versatile",  "label": "Llama 3.3 70B (Groq)",  "provider": "groq"},
     {"id": "llama3-70b-8192",          "label": "Llama 3 70B (Groq)",    "provider": "groq"},
@@ -70,7 +127,6 @@ GROQ_MODELS = [
     {"id": "llama-3.1-8b-instant",     "label": "Llama 3.1 8B (Groq)",   "provider": "groq"},
 ]
 
-# OpenRouter — optional fallback
 OPENROUTER_MODELS = [
     {"id": "deepseek/deepseek-chat-v3-0324:free",    "label": "DeepSeek V3 (OR)",  "provider": "openrouter"},
     {"id": "deepseek/deepseek-r1:free",              "label": "DeepSeek R1 (OR)",  "provider": "openrouter"},
@@ -105,34 +161,77 @@ def save_history(history):
 chat_history = load_history()
 
 # ── Emotion Detection ─────────────────────────────────────────
+_SHORT_RE = re.compile(r"[\W_]+", re.UNICODE)
+
 def detect_emotion(text: str) -> tuple[str, float]:
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    """
+    Returns (top_emotion, confidence_percent).
+    - Uses model's own label order (normalised int keys) to avoid index mismatches.
+    - Forces neutral for ultra-short / low-signal messages.
+    - Dampens confidence for very short inputs.
+    """
+    clean  = text.strip()
+    signal = _SHORT_RE.sub("", clean)  # strip punctuation to measure real signal length
+
+    if len(signal) <= 2:
+        return "neutral", 60.0
+
+    inputs = tokenizer(clean, return_tensors="pt", truncation=True, max_length=512)
     with torch.no_grad():
         logits = emotion_classifier(**inputs).logits
-    probs = F.softmax(logits, dim=-1)
-    idx = torch.argmax(probs, dim=-1).item()
-    return EMOTION_LABELS[idx], round(probs[0][idx].item() * 100, 1)
+    probs = F.softmax(logits, dim=-1)[0]
+
+    idx   = int(torch.argmax(probs).item())
+    # Bounds-check: if model returns an index outside our label list, fall back
+    label = EMOTION_LABELS[idx] if 0 <= idx < len(EMOTION_LABELS) else "neutral"
+    conf  = float(probs[idx].item()) * 100.0
+
+    # Dampen confidence for short messages (more honest UX)
+    if len(signal) < 8:
+        conf = min(conf, 78.0)
+
+    return label, round(conf, 1)
 
 # ── System Prompts ────────────────────────────────────────────
 def get_system_prompt(emotion: str) -> str:
-    if emotion in ["sadness", "grief", "remorse"]:
-        return "You are a warm, gentle companion. The user is experiencing deep pain. Listen first, validate their feelings without minimizing them, then offer soft comfort. Be present, not prescriptive. Keep responses concise and human."
-    elif emotion in ["disappointment", "disapproval", "disgust", "annoyance", "anger"]:
-        return "You are a calm, grounded presence helping someone process frustration. Acknowledge their feelings, offer perspective without dismissing, and gently redirect toward calm. Be concise."
-    elif emotion in ["fear", "nervousness"]:
-        return "You are a steady, reassuring guide. Help the user feel safe and grounded. Use calming language and gentle reasoning. Be concise."
-    elif emotion in ["joy", "excitement", "amusement", "love", "admiration", "pride"]:
-        return "You are an enthusiastic, warm companion matching the user's positive energy. Celebrate with them genuinely! Be fun and engaging."
-    elif emotion in ["gratitude", "relief", "optimism", "approval", "caring", "desire"]:
-        return "You are a warm, appreciative companion. Acknowledge the user's positive feelings with sincerity and gentle encouragement."
-    elif emotion in ["confusion", "curiosity", "realization", "surprise"]:
-        return "You are a thoughtful intellectual companion. Help the user explore ideas and satisfy their curiosity with depth and nuance."
+    if emotion in ("sadness", "grief", "remorse"):
+        return (
+            "You are a warm, gentle companion. The user is experiencing deep pain. "
+            "Listen first, validate their feelings without minimising them, then offer soft comfort. "
+            "Be present, not prescriptive. Keep responses concise and human."
+        )
+    elif emotion in ("disappointment", "disapproval", "disgust", "annoyance", "anger"):
+        return (
+            "You are a calm, grounded presence helping someone process frustration. "
+            "Acknowledge their feelings, offer perspective without dismissing, and gently redirect toward calm. "
+            "Be concise."
+        )
+    elif emotion in ("fear", "nervousness"):
+        return (
+            "You are a steady, reassuring guide. Help the user feel safe and grounded. "
+            "Use calming language and gentle reasoning. Be concise."
+        )
+    elif emotion in ("joy", "excitement", "amusement", "love", "admiration", "pride"):
+        return (
+            "You are an enthusiastic, warm companion matching the user's positive energy. "
+            "Celebrate with them genuinely! Be fun and engaging."
+        )
+    elif emotion in ("gratitude", "relief", "optimism", "approval", "caring", "desire"):
+        return (
+            "You are a warm, appreciative companion. "
+            "Acknowledge the user's positive feelings with sincerity and gentle encouragement."
+        )
+    elif emotion in ("confusion", "curiosity", "realization", "surprise"):
+        return (
+            "You are a thoughtful intellectual companion. "
+            "Help the user explore ideas and satisfy their curiosity with depth and nuance."
+        )
     return "You are a friendly, attentive assistant. Be natural, helpful, and engaging. Keep responses concise."
 
 # ── LLM Providers ─────────────────────────────────────────────
 def call_groq(system_prompt: str, messages: list, model_id: str) -> str:
     if not GROQ_API_KEY:
-        raise ValueError("No Groq API key")
+        raise ValueError("No Groq API key configured")
     resp = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -142,7 +241,7 @@ def call_groq(system_prompt: str, messages: list, model_id: str) -> str:
             "temperature": 0.75,
             "max_tokens": 600,
         },
-        timeout=20
+        timeout=20,
     )
     data = resp.json()
     print(f"[Groq] model={model_id} status={resp.status_code}")
@@ -152,7 +251,7 @@ def call_groq(system_prompt: str, messages: list, model_id: str) -> str:
 
 def call_openrouter(system_prompt: str, messages: list, model_id: str) -> str:
     if not OPENROUTER_API_KEY:
-        raise ValueError("No OpenRouter API key")
+        raise ValueError("No OpenRouter API key configured")
     resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -167,7 +266,7 @@ def call_openrouter(system_prompt: str, messages: list, model_id: str) -> str:
             "temperature": 0.75,
             "max_tokens": 600,
         },
-        timeout=30
+        timeout=30,
     )
     data = resp.json()
     print(f"[OpenRouter] model={model_id} status={resp.status_code}")
@@ -175,19 +274,23 @@ def call_openrouter(system_prompt: str, messages: list, model_id: str) -> str:
         return data["choices"][0]["message"]["content"].strip()
     raise ValueError(data.get("error", {}).get("message", str(data)))
 
-def call_llm(system_prompt: str, user_message: str, history: list, preferred_model_id: str = None) -> tuple[str, str]:
-    """Returns (reply_text, model_label_used)"""
-    recent = history[-12:] if len(history) > 12 else history
+def call_llm(
+    system_prompt: str,
+    user_message: str,
+    history: list,
+    preferred_model_id: str = None,
+) -> tuple[str, str]:
+    """Returns (reply_text, model_label_used)."""
+    recent   = history[-12:]
     messages = []
     for entry in recent:
-        role = "user" if entry["role"] == "user" else "assistant"
-        messages.append({"role": role, "content": entry["text"]})
+        role = "assistant" if entry.get("role") in ("bot", "assistant") else "user"
+        messages.append({"role": role, "content": entry.get("text", "")})
     messages.append({"role": "user", "content": user_message})
 
-    # Build candidate list: preferred first, then all others
     if preferred_model_id:
-        preferred = next((m for m in ALL_MODELS if m["id"] == preferred_model_id), None)
-        others    = [m for m in ALL_MODELS if m["id"] != preferred_model_id]
+        preferred  = next((m for m in ALL_MODELS if m["id"] == preferred_model_id), None)
+        others     = [m for m in ALL_MODELS if m["id"] != preferred_model_id]
         candidates = ([preferred] if preferred else []) + others
     else:
         candidates = ALL_MODELS
@@ -209,7 +312,7 @@ def call_llm(system_prompt: str, user_message: str, history: list, preferred_mod
         "⚠️ Could not get a response.\n\n"
         "Make sure GROQ_API_KEY is set in your .env file.\n"
         "Get a free key at: console.groq.com",
-        "none"
+        "none",
     )
 
 # ── Routes ────────────────────────────────────────────────────
@@ -232,33 +335,46 @@ def chat():
 @app.route("/send", methods=["POST"])
 def send():
     global chat_history
-    data = request.get_json()
+    data       = request.get_json()
     user_input = (data.get("message") or "").strip()
     model_id   = data.get("model") or None
+
     if not user_input:
         return jsonify({"error": "Empty message"}), 400
 
     emotion, confidence = detect_emotion(user_input)
-    system_prompt = get_system_prompt(emotion)
+    system_prompt       = get_system_prompt(emotion)
     bot_reply, model_used = call_llm(system_prompt, user_input, chat_history, model_id)
 
     meta      = EMOTION_META.get(emotion, {"color": "#a0a8b8", "emoji": "😐"})
     timestamp = datetime.now().strftime("%H:%M")
 
-    chat_history.append({"role": "user", "text": user_input, "time": timestamp})
     chat_history.append({
-        "role": "bot", "text": bot_reply,
-        "emotion": emotion, "confidence": confidence,
-        "emoji": meta["emoji"], "color": meta["color"],
-        "time": timestamp, "model": model_used,
+        "role":       "user",
+        "text":       user_input,
+        "time":       timestamp,
+        "emotion":    emotion,
+        "confidence": confidence,
+        "emoji":      meta["emoji"],
+        "color":      meta["color"],
     })
+    chat_history.append({
+        "role":  "bot",
+        "text":  bot_reply,
+        "time":  timestamp,
+        "model": model_used,
+    })
+
     save_history(chat_history)
 
     return jsonify({
-        "bot_reply": bot_reply,
-        "emotion": emotion, "confidence": confidence,
-        "emoji": meta["emoji"], "color": meta["color"],
-        "time": timestamp, "model_used": model_used,
+        "bot_reply":  bot_reply,
+        "emotion":    emotion,
+        "confidence": confidence,
+        "emoji":      meta["emoji"],
+        "color":      meta["color"],
+        "time":       timestamp,
+        "model_used": model_used,
     })
 
 @app.route("/clear", methods=["POST"])
@@ -372,6 +488,7 @@ textarea::placeholder { color: var(--text-subtle); }
     </div>
   </header>
   <div class="emotion-bar"><div class="emotion-bar-fill" id="emotionFill"></div></div>
+
   <div class="messages" id="messages">
     {% if not chat_history %}
     <div class="empty-state" id="emptyState">
@@ -384,17 +501,14 @@ textarea::placeholder { color: var(--text-subtle); }
         {% if entry.role == 'user' %}
         <div class="message-row user">
           <div class="bubble user">{{ entry.text }}</div>
-          <div class="bubble-meta"><span>{{ entry.get('time', '') }}</span></div>
+          <div class="bubble-meta">
+            <span>{{ entry.get('time', '') }}</span>
+          </div>
         </div>
         {% else %}
         <div class="message-row bot">
           <div class="bubble bot">{{ entry.text }}</div>
           <div class="bubble-meta">
-            {% if entry.get('emotion') %}
-            <span class="emotion-tag" style="color:{{ entry.color }};border-color:{{ entry.color }}30;background:{{ entry.color }}10;">
-              {{ entry.emoji }} {{ entry.emotion }} · {{ entry.confidence }}%
-            </span>
-            {% endif %}
             <span>{{ entry.get('time', '') }}</span>
             {% if entry.get('model') %}<span class="model-tag">· {{ entry.model }}</span>{% endif %}
           </div>
@@ -403,6 +517,7 @@ textarea::placeholder { color: var(--text-subtle); }
       {% endfor %}
     {% endif %}
   </div>
+
   <div class="input-area">
     <div class="input-row">
       <textarea id="input" placeholder="Share what's on your mind…" rows="1" autocomplete="off"></textarea>
@@ -413,7 +528,9 @@ textarea::placeholder { color: var(--text-subtle); }
     <div class="input-hint">Enter to send &nbsp;·&nbsp; Shift+Enter for new line</div>
   </div>
 </div>
+
 <div class="toast" id="toast"></div>
+
 <script>
 const messagesEl=document.getElementById('messages'),inputEl=document.getElementById('input'),
       sendBtn=document.getElementById('sendBtn'),emotionFill=document.getElementById('emotionFill'),
@@ -438,7 +555,19 @@ function appendUserBubble(text,time){
   const row=document.createElement('div'); row.className='message-row user';
   row.innerHTML=`<div class="bubble user">${escHtml(text)}</div><div class="bubble-meta"><span>${time}</span></div>`;
   messagesEl.appendChild(row); scrollBottom();
+  return row;
 }
+
+function setUserEmotion(row,emotion,confidence,emoji,color,time){
+  // Emotion tag removed from UI — emotion still drives bot personality silently
+  const meta=row.querySelector('.bubble-meta');
+  meta.innerHTML=`<span>${time}</span>`;
+  if(color){
+    emotionFill.style.background=color;
+    emotionFill.style.width=`${Math.min(confidence,99)}%`;
+  }
+}
+
 function appendTyping(){
   const row=document.createElement('div'); row.className='typing-row'; row.id='typing';
   row.innerHTML=`<div class="typing-bubble"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
@@ -446,40 +575,56 @@ function appendTyping(){
 }
 function removeTyping(){ const t=document.getElementById('typing'); if(t)t.remove(); }
 
-function appendBotBubble(text,emotion,confidence,emoji,color,time,modelUsed){
+function appendBotBubble(text,time,modelUsed){
   const row=document.createElement('div'); row.className='message-row bot';
-  const eTag=emotion?`<span class="emotion-tag" style="color:${color};border-color:${color}30;background:${color}10;">${emoji} ${emotion} · ${confidence}%</span>`:'';
   const mTag=(modelUsed&&modelUsed!=='none')?`<span class="model-tag">· ${modelUsed}</span>`:'';
-  row.innerHTML=`<div class="bubble bot">${escHtml(text)}</div><div class="bubble-meta">${eTag}<span>${time}</span>${mTag}</div>`;
+  row.innerHTML=`<div class="bubble bot">${escHtml(text)}</div><div class="bubble-meta"><span>${time}</span>${mTag}</div>`;
   messagesEl.appendChild(row); scrollBottom();
-  if(color){ emotionFill.style.background=color; emotionFill.style.width=`${Math.min(confidence,99)}%`; }
 }
 
 async function sendMessage(){
   const text=inputEl.value.trim(); if(!text)return;
   removeEmpty();
-  const time=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-  appendUserBubble(text,time);
+  const localTime=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  const userRow=appendUserBubble(text,localTime);
+
   inputEl.value=''; inputEl.style.height='auto'; sendBtn.disabled=true;
   appendTyping();
+
   try{
-    const res=await fetch('/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,model:modelSelect.value})});
-    const data=await res.json(); removeTyping();
-    if(data.error) appendBotBubble('⚠️ '+data.error,null,0,'','',time,null);
-    else appendBotBubble(data.bot_reply,data.emotion,data.confidence,data.emoji,data.color,data.time,data.model_used);
-  }catch(e){ removeTyping(); appendBotBubble('⚠️ Network error. Please try again.',null,0,'','',time,null); }
+    const res=await fetch('/send',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:text,model:modelSelect.value})
+    });
+    const data=await res.json();
+    removeTyping();
+
+    if(data.error){
+      appendBotBubble('⚠️ '+data.error,localTime,null);
+    }else{
+      setUserEmotion(userRow,data.emotion,data.confidence,data.emoji,data.color,data.time);
+      appendBotBubble(data.bot_reply,data.time,data.model_used);
+    }
+  }catch(e){
+    removeTyping();
+    appendBotBubble('⚠️ Network error. Please try again.',localTime,null);
+  }
+
   sendBtn.disabled=false; inputEl.focus();
 }
 
 inputEl.addEventListener('input',function(){ this.style.height='auto'; this.style.height=Math.min(this.scrollHeight,140)+'px'; });
 inputEl.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); sendMessage(); } });
 sendBtn.addEventListener('click',sendMessage);
+
 clearBtn.addEventListener('click',async()=>{
   if(!confirm('Clear the entire conversation?'))return;
   await fetch('/clear',{method:'POST'});
   messagesEl.innerHTML=`<div class="empty-state" id="emptyState"><div class="empty-icon">✦</div><div class="empty-title">How are you feeling?</div><div class="empty-sub">I'll listen carefully and respond to what you're actually experiencing right now.</div></div>`;
   emotionFill.style.width='0%'; showToast('Conversation cleared');
 });
+
 scrollBottom(); inputEl.focus();
 </script>
 </body>
@@ -489,7 +634,9 @@ if __name__ == "__main__":
     port  = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("DEBUG", "true").lower() == "true"
     print(f"\n{'='*55}")
-    print(f"  Groq key:       {'✅ SET' if GROQ_API_KEY else '❌ MISSING — get free at console.groq.com'}")
+    print(f"  Groq key:       {'✅ SET' if GROQ_API_KEY else '❌ MISSING — get free key at console.groq.com'}")
     print(f"  OpenRouter key: {'✅ SET (fallback)' if OPENROUTER_API_KEY else '⚠️  not set (optional)'}")
+    print(f"  Emotion labels: {len(EMOTION_LABELS)} loaded")
+    print(f"  Label order:    {EMOTION_LABELS[25]} @ idx 25, {EMOTION_LABELS[26]} @ idx 26  (should be sadness/surprise)")
     print(f"{'='*55}\n")
     app.run(debug=debug, port=port)
